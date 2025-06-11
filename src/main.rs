@@ -72,7 +72,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli_args = Args::parse();
-    let user_message = if cli_args.message.is_empty() {
+    let mut user_message = if cli_args.message.is_empty() {
         eprint!("Message: ");
         io::stdout().flush()?;
         let mut buffer = String::new();
@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli_args.message.join(" ")
     };
+    user_message.push_str("If you want to call a script, use terminal_call:\\n```");
 
     let mut state = if cli_args.continue_conversation && Path::new(CONVERSATION_FILE).exists() {
         let s = fs::read_to_string(CONVERSATION_FILE)?;
