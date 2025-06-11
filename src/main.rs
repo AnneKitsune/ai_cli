@@ -9,8 +9,8 @@ use chrono::prelude::*;
 use sys_info::hostname;
 use dirs;
 use async_openai::{
-    types::{ChatCompletionRequestMessage, ChatCompletionTool, Role, ChatCompletionResponseMessage},
-    config::{OpenAIConfig, Config},
+    types::{ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolType, FunctionObject, ChatCompletionRequestSystemMessage},
+    config::{OpenAIConfig},
     Client,
 };
 
@@ -19,7 +19,7 @@ const LOG_FILE: &str = "/tmp/ai_log.csv";
 const DEFAULT_API_BASE: &str = "http://ai3:8080/v1";
 const DEFAULT_API_KEY: &str = "empty";
 const SYSTEM_PROMPT: &str = r#"
-You are an AI assistant that can run terminal commands to install programs automatically in virtual machines.
+You are an AI assistant that can run terminal commands.
 You will use a provided tool to execute terminal commands when necessary.
 You may also simply reply to the user without using a tool call.
 
@@ -35,7 +35,6 @@ Parameters:
   - command: The command string to execute (required)
 Special handling for 'cd': If the command starts with 'cd', it will update the working directory without requiring a new prompt.
 
-If the --safe flag is used, the human will be asked to confirm before executing commands.
 Output will be captured and returned as a string.
 
 Do not chain commands with '&&' or ';'. Only one command per tool call.
@@ -62,6 +61,10 @@ struct Args {
     /// Confirm before executing commands
     #[arg(short, long)]
     safe: bool,
+
+    /// Enable tool/function calling (may not be supported by all models)
+    #[arg(short, long)]
+    tools: bool,
 
     /// API base URL
     #[arg(short='b', long, default_value_t = DEFAULT_API_BASE.to_string(), value_hint = ValueHint::Url)]
@@ -96,22 +99,17 @@ async fn main() -> anyhow::Result<()> {
         serde_json::from_str(&s)?
     } else {
         State {
-            messages: vec![ChatCompletionRequestMessage::System {
-                role: Role::System,
-                content: Some(SYSTEM_PROMPT.trim().to_owned()),
+            messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: async_openai::types::ChatCompletionRequestSystemMessageContent::Text(SYSTEM_PROMPT.trim().to_owned()),
                 name: None,
-            }],
+            })],
             terminal_state: TerminalState {
                 cwd: std::env::current_dir()?,
             },
         }
     };
 
-    state.messages.push(ChatCompletionRequestMessage::User {
-        role: Role::User,
-        content: user_message.clone(),
-        name: None,
-    });
+    state.messages.push(ChatCompletionRequestMessage::User(user_message.clone().into()));
 
     log_event("user", None, &user_message)?;
 
@@ -137,20 +135,26 @@ async fn main() -> anyhow::Result<()> {
                 },
                 "required": ["command"]
             })),
+            strict: None,
         },
     };
 
     loop {
         // Convert state.messages to owned so we can use in request
         let messages = state.messages.clone();
+        let mut request = async_openai::types::CreateChatCompletionRequest {
+            model: cli_args.model.clone(),
+            messages,
+            ..Default::default()
+        };
+
+        if cli_args.tools {
+            request.tools = Some(vec![terminal_tool.clone()]);
+        }
+
         let request = ai_client
             .chat()
-            .create(async_openai::types::CreateChatCompletionRequest {
-                model: cli_args.model.clone(),
-                messages,
-                tools: Some(vec![terminal_tool.clone()]),
-                ..Default::default()
-            })
+            .create(request)
             .await?;
 
         let choice = request
@@ -172,22 +176,24 @@ async fn main() -> anyhow::Result<()> {
                         let mut r = String::new();
                         io::stdin().read_line(&mut r)?;
                         if r.trim().to_lowercase() != "y" {
-                            state.messages.push(ChatCompletionRequestMessage::Tool {
-                                role: Role::Tool,
-                                content: Some(format!("Command execution canceled: {}", cmd)),
-                                tool_call_id: Some(call.id.clone()),
-                            });
+                            state.messages.push(ChatCompletionRequestMessage::Tool(
+                                async_openai::types::ChatCompletionRequestToolMessage {
+                                    content: async_openai::types::ChatCompletionRequestToolMessageContent::Text(format!("Command execution canceled: {}", cmd)),
+                                    tool_call_id: call.id.clone(),
+                                }
+                            ));
                             log_event("tool_canceled", None, cmd)?;
                             continue;
                         }
                     }
 
                     let result = run_terminal_command(cmd, &mut state)?;
-                    state.messages.push(ChatCompletionRequestMessage::Tool {
-                        role: Role::Tool,
-                        content: Some(result.clone()),
-                        tool_call_id: Some(call.id.clone()),
-                    });
+                    state.messages.push(ChatCompletionRequestMessage::Tool(
+                        async_openai::types::ChatCompletionRequestToolMessage {
+                            content: async_openai::types::ChatCompletionRequestToolMessageContent::Text(result.clone()),
+                            tool_call_id: call.id.clone(),
+                        }
+                    ));
                     log_event("tool_executed", None, &result)?;
                 }
             }
@@ -196,12 +202,16 @@ async fn main() -> anyhow::Result<()> {
             println!("assistant: {}", content);
             log_event("assistant", None, content)?;
             // Manually create an assistant message from the response
-            state.messages.push(ChatCompletionRequestMessage::Assistant {
-                role: Role::Assistant,
-                content: message.content.clone(),
-                name: None,
-                tool_calls: None,
-            });
+            state.messages.push(ChatCompletionRequestMessage::Assistant(
+                async_openai::types::ChatCompletionRequestAssistantMessage {
+                    content: message.content.map(|c| async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(c)),
+                    name: None,
+                    tool_calls: None,
+                    function_call: None,
+                    audio: None,
+                    refusal: None,
+                }
+            ));
             break;
         }
     }
