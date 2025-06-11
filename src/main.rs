@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     let ai_client = Client::with_config(ai_config);
 
     // Define the terminal tool for API requests
-    let terminal_tool = ChatCompletionTool {
+    let _terminal_tool = ChatCompletionTool {
         r#type: ChatCompletionToolType::Function,
         function: FunctionObject {
             name: "terminal".to_string(),
@@ -184,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 name: None,
                 tool_calls: None,
+                #[allow(deprecated)]
                 function_call: None,
                 audio: None,
                 refusal: None,
