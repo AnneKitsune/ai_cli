@@ -1,18 +1,19 @@
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage, ChatCompletionTool,
+        ChatCompletionToolType, FunctionObject,
+    },
+};
+use chrono::prelude::*;
 use clap::{Parser, ValueHint};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write, BufRead};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::process::Command;
-use chrono::prelude::*;
 use sys_info::hostname;
-use dirs;
-use async_openai::{
-    types::{ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolType, FunctionObject, ChatCompletionRequestSystemMessage},
-    config::{OpenAIConfig},
-    Client,
-};
 
 const CONVERSATION_FILE: &str = "/tmp/ai_conversation";
 const LOG_FILE: &str = "/tmp/ai_log.csv";
@@ -20,35 +21,26 @@ const DEFAULT_API_BASE: &str = "http://ai3:8080/v1";
 const DEFAULT_API_KEY: &str = "empty";
 const SYSTEM_PROMPT: &str = r#"
 You are an AI assistant that can run terminal commands.
-You will use a provided tool to execute terminal commands when necessary.
-You may also simply reply to the user without using a tool call.
+To execute commands, format them like this:
+
+terminal_call:
+```
+your commands here
+```
 
 Important Guidelines:
-1. For file editing: Either use `sed` directly OR use `cat -n` to inspect with line numbers and then use `sed` to modify specific lines.
-2. Avoid interactive commands unless necessary - most operations should be scriptable.
-3. The terminal tool maintains state (like current directory) between calls during the same conversation.
-4. Be cautious with destructive operations and always have rollbacks where possible.
+1. Commands will be executed as a POSIX-compliant shell script using /bin/sh
+2. Each execution starts fresh in the initial working directory
+3. You can use full shell syntax including &&, ||, ;, | etc.
+4. For file editing: Either use `sed` directly OR use `cat -n` to inspect with line numbers and then use `sed` to modify specific lines.
+5. Be cautious with destructive operations and always have rollbacks where possible.
 
-Tool: 'terminal'
-Purpose: Execute a single terminal command. Maintains current working directory across calls.
-Parameters:
-  - command: The command string to execute (required)
-Special handling for 'cd': If the command starts with 'cd', it will update the working directory without requiring a new prompt.
-
-Output will be captured and returned as a string.
-
-Do not chain commands with '&&' or ';'. Only one command per tool call.
+The script will be executed directly from memory when possible, or saved to /tmp/ai_cli_script.sh if needed.
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     messages: Vec<ChatCompletionRequestMessage>,
-    terminal_state: TerminalState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TerminalState {
-    cwd: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -61,10 +53,6 @@ struct Args {
     /// Confirm before executing commands
     #[arg(short, long)]
     safe: bool,
-
-    /// Enable tool/function calling (may not be supported by all models)
-    #[arg(short, long)]
-    tools: bool,
 
     /// API base URL
     #[arg(short='b', long, default_value_t = DEFAULT_API_BASE.to_string(), value_hint = ValueHint::Url)]
@@ -99,17 +87,20 @@ async fn main() -> anyhow::Result<()> {
         serde_json::from_str(&s)?
     } else {
         State {
-            messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: async_openai::types::ChatCompletionRequestSystemMessageContent::Text(SYSTEM_PROMPT.trim().to_owned()),
-                name: None,
-            })],
-            terminal_state: TerminalState {
-                cwd: std::env::current_dir()?,
-            },
+            messages: vec![ChatCompletionRequestMessage::System(
+                ChatCompletionRequestSystemMessage {
+                    content: async_openai::types::ChatCompletionRequestSystemMessageContent::Text(
+                        SYSTEM_PROMPT.trim().to_owned(),
+                    ),
+                    name: None,
+                },
+            )],
         }
     };
 
-    state.messages.push(ChatCompletionRequestMessage::User(user_message.clone().into()));
+    state.messages.push(ChatCompletionRequestMessage::User(
+        user_message.clone().into(),
+    ));
 
     log_event("user", None, &user_message)?;
 
@@ -139,122 +130,124 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
-    loop {
-        // Convert state.messages to owned so we can use in request
-        let messages = state.messages.clone();
-        let mut request = async_openai::types::CreateChatCompletionRequest {
-            model: cli_args.model.clone(),
-            messages,
-            ..Default::default()
-        };
+    let messages = state.messages.clone();
+    let request = async_openai::types::CreateChatCompletionRequest {
+        model: cli_args.model.clone(),
+        messages,
+        ..Default::default()
+    };
 
-        if cli_args.tools {
-            request.tools = Some(vec![terminal_tool.clone()]);
-        }
+    let response = ai_client.chat().create(request).await?;
+    let message = response
+        .choices
+        .first()
+        .ok_or(anyhow::anyhow!("No choices returned"))?
+        .message
+        .clone();
+    let content = message.content.as_deref().unwrap_or_default();
 
-        let request = ai_client
-            .chat()
-            .create(request)
-            .await?;
+    // Print assistant message
+    println!("{}", content);
+    log_event("assistant", None, content)?;
 
-        let choice = request
-            .choices
-            .first()
-            .ok_or(anyhow::anyhow!("No choices returned"))?;
-        let message = choice.message.clone();
+    // Check for terminal call
+    if let Some(script) = extract_terminal_call(content) {
+        // Calculate context length
+        let context_len = estimate_context_length(&state.messages);
+        println!("Current context length: {} tokens", context_len);
 
-        if let Some(tool_calls) = message.tool_calls.clone() {
-            log_event("assistant_tool_calls", None, &serde_json::to_string(&tool_calls)?)?;
-            for call in tool_calls {
-                if call.function.name == "terminal" {
-                    let function = call.function.clone();
-                    let args: HashMap<String, String> = serde_json::from_str(&function.arguments)?;
-                    let cmd = args.get("command").ok_or(anyhow::anyhow!("Missing command"))?;
-
-                    if cli_args.safe {
-                        println!("Execute command? [y极/N]\n  {}", cmd);
-                        let mut r = String::new();
-                        io::stdin().read_line(&mut r)?;
-                        if r.trim().to_lowercase() != "y" {
-                            state.messages.push(ChatCompletionRequestMessage::Tool(
-                                async_openai::types::ChatCompletionRequestToolMessage {
-                                    content: async_openai::types::ChatCompletionRequestToolMessageContent::Text(format!("Command execution canceled: {}", cmd)),
-                                    tool_call_id: call.id.clone(),
-                                }
-                            ));
-                            log_event("tool_canceled", None, cmd)?;
-                            continue;
-                        }
-                    }
-
-                    let result = run_terminal_command(cmd, &mut state)?;
-                    state.messages.push(ChatCompletionRequestMessage::Tool(
-                        async_openai::types::ChatCompletionRequestToolMessage {
-                            content: async_openai::types::ChatCompletionRequestToolMessageContent::Text(result.clone()),
-                            tool_call_id: call.id.clone(),
-                        }
-                    ));
-                    log_event("tool_executed", None, &result)?;
-                }
+        if cli_args.safe {
+            print!("Execute script? [Y/n]: ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if input.trim().to_lowercase() == "n" {
+                log_event("script_canceled", None, "User canceled")?;
+                return Ok(());
             }
-        } else {
-            let content: &str = message.content.as_deref().unwrap_or_default();
-            println!("assistant: {}", content);
-            log_event("assistant", None, content)?;
-            // Manually create an assistant message from the response
-            state.messages.push(ChatCompletionRequestMessage::Assistant(
-                async_openai::types::ChatCompletionRequestAssistantMessage {
-                    content: message.content.map(|c| async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(c)),
-                    name: None,
-                    tool_calls: None,
-                    function_call: None,
-                    audio: None,
-                    refusal: None,
-                }
-            ));
-            break;
         }
+
+        let result = run_script(&script)?;
+        println!("{}", result);
+        log_event("script_output", None, &result)?;
+
+        // Append output to conversation
+        state.messages.push(ChatCompletionRequestMessage::Assistant(
+            async_openai::types::ChatCompletionRequestAssistantMessage {
+                content: Some(
+                    async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(
+                        format!(
+                            "Script executed:\n```\n{}\n```\nOutput:\n{}",
+                            script, result
+                        ),
+                    ),
+                ),
+                name: None,
+                tool_calls: None,
+                function_call: None,
+                audio: None,
+                refusal: None,
+            },
+        ));
     }
 
     save_state(&state)?;
     Ok(())
 }
 
-fn run_terminal_command(cmd: &str, state: &mut State) -> anyhow::Result<String> {
-    let mut parts = cmd.split_whitespace();
-    let main_cmd = parts.next().unwrap();
-
-    if main_cmd == "cd" {
-        let dir = parts.next().unwrap_or("~");
-        let path = if dir == "~" {
-            dirs::home_dir().ok_or(anyhow::anyhow!("No home dir found"))?
-        } else {
-            let abs_path = if Path::new(dir).is_absolute() {
-                PathBuf::from(dir)
-            } else {
-                state.terminal_state.cwd.join(dir)
-            };
-            if !abs_path.exists() {
-                return Err(anyhow::anyhow!("Directory not found: {:?}", abs_path));
-            }
-            abs_path
-        };
-        state.terminal_state.cwd = path.clone();
-        return Ok(format!("Changed directory to: {:?}", path));
+fn extract_terminal_call(content: &str) -> Option<String> {
+    let pattern = "terminal_call:\n```\n";
+    if let Some(start) = content.find(pattern) {
+        let remaining = &content[start + pattern.len()..];
+        if let Some(end) = remaining.find("\n```") {
+            return Some(remaining[..end].to_string());
+        }
     }
+    None
+}
 
+fn estimate_context_length(messages: &[ChatCompletionRequestMessage]) -> usize {
+    let total_words: usize = messages
+        .iter()
+        .map(|msg| match msg {
+            ChatCompletionRequestMessage::System(s) => match &s.content {
+                async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => {
+                    t.split_whitespace().count()
+                }
+                _ => 0,
+            },
+            ChatCompletionRequestMessage::User(u) => match &u.content {
+                async_openai::types::ChatCompletionRequestUserMessageContent::Text(t) => {
+                    t.split_whitespace().count()
+                }
+                _ => 0,
+            },
+            ChatCompletionRequestMessage::Assistant(a) => {
+                a.content.as_ref().map_or(0, |c| match c {
+                    async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(t) => {
+                        t.split_whitespace().count()
+                    }
+                    _ => 0,
+                })
+            }
+            _ => 0,
+        })
+        .sum();
+    (total_words as f64 * 1.2).round() as usize
+}
+
+fn run_script(script: &str) -> anyhow::Result<String> {
     let output = Command::new("sh")
         .arg("-c")
-        .arg(cmd)
-        .current_dir(&state.terminal_state.cwd)
+        .arg(script)
+        .current_dir(std::env::current_dir()?)
         .output()?;
 
-    let result = if output.status.success() {
-        String::from_utf8(output.stdout)?
-    } else {
-        String::from_utf8(output.stderr)?
-    };
-
+    let result = String::from_utf8(output.stdout)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8(output.stderr)?;
+        return Ok(format!("Error:\n{}\nOutput:\n{}", stderr, result));
+    }
     Ok(result)
 }
 
@@ -281,14 +274,7 @@ fn log_event(
         .has_headers(!Path::new(LOG_FILE).exists())
         .from_writer(file);
 
-    wtr.write_record(&[
-        &timestamp,
-        event_type,
-        &host,
-        &id,
-        &function,
-        details,
-    ])?;
+    wtr.write_record(&[&timestamp, event_type, &host, &id, &function, details])?;
 
     wtr.flush()?;
     Ok(())
