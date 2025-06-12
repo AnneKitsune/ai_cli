@@ -54,6 +54,10 @@ struct Args {
     #[arg(short, long)]
     safe: bool,
 
+    /// Keep looping until AI says "Fully Done Processing"
+    #[arg(short, long)]
+    loop: bool,
+
     /// API base URL
     #[arg(short='b', long, default_value_t = DEFAULT_API_BASE.to_string(), value_hint = ValueHint::Url)]
     api_base: String,
@@ -81,6 +85,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli_args.message.join(" ")
     };
+
+    if cli_args.loop {
+        user_message.push_str("\n\nIMPORTANT: To keep processing, provide terminal commands when needed. When fully done, say \"Fully Done Processing\".");
+    }
     user_message.push_str("If you want to call a script, use terminal_call:\\n```");
 
     let mut state = if cli_args.continue_conversation && Path::new(CONVERSATION_FILE).exists() {
@@ -194,7 +202,44 @@ async fn main() -> anyhow::Result<()> {
     }
 
     save_state(&state)?;
+
+    if cli_args.loop {
+        let content_lower = content.to_lowercase();
+        if content_lower.contains("fully done processing") {
+            return Ok(());
+        }
+        
+        // Recurse with empty message to continue
+        let new_args = Args {
+            message: vec![],
+            continue_conversation: true,
+            safe: cli_args.safe,
+            loop: true,
+            api_base: cli_args.api_base.clone(),
+            api_key: cli_args.api_key.clone(),
+            model: cli_args.model.clone(),
+        };
+        return main_with_args(new_args).await;
+    }
+
     Ok(())
+}
+
+async fn main_with_args(cli_args: Args) -> anyhow::Result<()> {
+    let mut user_message = if cli_args.message.is_empty() {
+        eprint!("Message: ");
+        io::stdout().flush()?;
+        let mut buffer = String::new();
+        io::stdin().lock().read_line(&mut buffer)?;
+        buffer.trim().to_owned()
+    } else {
+        cli_args.message.join(" ")
+    };
+
+    if cli_args.loop {
+        user_message.push_str("\n\nIMPORTANT: To keep processing, provide terminal commands when needed. When fully done, say \"Fully Done Processing\".");
+    }
+    user_message.push_str("If you want to call a script, use terminal_call:\\n```");
 }
 
 fn extract_terminal_call(content: &str) -> Option<String> {
