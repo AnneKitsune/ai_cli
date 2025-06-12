@@ -56,7 +56,7 @@ struct Args {
 
     /// Keep looping until AI says "Fully Done Processing"
     #[arg(short, long)]
-    loop: bool,
+    looping: bool,
 
     /// API base URL
     #[arg(short='b', long, default_value_t = DEFAULT_API_BASE.to_string(), value_hint = ValueHint::Url)]
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         cli_args.message.join(" ")
     };
 
-    if cli_args.loop {
+    if cli_args.looping {
         user_message.push_str("\n\nIMPORTANT: To keep processing, provide terminal commands when needed. When fully done, say \"Fully Done Processing\".");
     }
     user_message.push_str("If you want to call a script, use terminal_call:\\n```");
@@ -203,18 +203,18 @@ async fn main() -> anyhow::Result<()> {
 
     save_state(&state)?;
 
-    if cli_args.loop {
+    if cli_args.looping {
         let content_lower = content.to_lowercase();
         if content_lower.contains("fully done processing") {
             return Ok(());
         }
-        
+
         // Recurse with empty message to continue
         let new_args = Args {
             message: vec![],
             continue_conversation: true,
             safe: cli_args.safe,
-            loop: true,
+            looping: true,
             api_base: cli_args.api_base.clone(),
             api_key: cli_args.api_key.clone(),
             model: cli_args.model.clone(),
@@ -236,10 +236,11 @@ async fn main_with_args(cli_args: Args) -> anyhow::Result<()> {
         cli_args.message.join(" ")
     };
 
-    if cli_args.loop {
+    if cli_args.looping {
         user_message.push_str("\n\nIMPORTANT: To keep processing, provide terminal commands when needed. When fully done, say \"Fully Done Processing\".");
     }
     user_message.push_str("If you want to call a script, use terminal_call:\\n```");
+    Ok(())
 }
 
 fn extract_terminal_call(content: &str) -> Option<String> {
